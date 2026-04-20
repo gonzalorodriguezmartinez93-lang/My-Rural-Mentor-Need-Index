@@ -4,114 +4,142 @@ import numpy as np
 import unicodedata
 from io import BytesIO
 
-st.set_page_config(page_title="Need Index | Auditoría Técnica", page_icon="🌱", layout="wide")
+st.set_page_config(page_title="Need Index | My Rural Mentor", page_icon="🌱", layout="wide")
 
-# --- FUNCIONES DE LIMPIEZA ---
+# --- 1. FUNCIONES DE NORMALIZACIÓN ---
 def normalizar(s):
     if pd.isna(s): return ""
     s = str(s).lower().replace('\n', ' ').strip()
     return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
 
-def transformar_genero(val):
-    v = normalizar(val)
-    if any(x in v for x in ['home', 'hombre', 'man', 'macho']): return 'M'
-    if any(x in v for x in ['muller', 'mujer', 'woman', 'femia']): return 'W'
-    return 'O'
+def zscore(x):
+    # Usamos ddof=0 tal como indica la instrucción exacta
+    std = x.std(ddof=0)
+    if std == 0: return x * 0
+    return (x - x.mean()) / std
 
-def puntuar_si_no(val):
-    v = normalizar(val)
-    # Si la respuesta contiene 'si', 'si', 'verdadeiro' o no es una negación clara
-    if any(x in v for x in ['si', 'si', 'sim', 'verdade']): return 1
-    return 0
-
-# --- MOTOR DE CÁLCULO REVISADO ---
-def calcular_indice_exacto(df):
-    df_c = df.copy()
-    
-    # 1. Identificar Columnas por posición/contenido para evitar fallos de nombre
-    # Duke: 11 ítems (Escala Likert Texto)
-    # PWI: 7 ítems (0-10) -> El 6º suele ser Comunidad
-    # Discrim: 5 ítems (Si/No)
-    
-    duke_cols = []
-    pwi_cols = []
-    discrim_cols = []
-    community_col = None
+# --- 2. DETECTOR DE COLUMNAS ---
+def detectar_columnas_mentor(df):
+    cols = {'id': None, 'gender': None, 'orientation': None, 'ethnicity': None, 
+            'duke': [], 'pwi': [], 'discrim': [], 'community': None}
     
     for c in df.columns:
         c_norm = normalizar(c)
-        sample = df[c].dropna().astype(str).unique()
-        
-        if 'discrimin' in c_norm:
-            discrim_cols.append(c)
+        # Demografía
+        if any(x in c_norm for x in ['id', 'nome', 'nombre']) and not cols['id']: cols['id'] = c
+        elif any(x in c_norm for x in ['xenero', 'genero']): cols['gender'] = c
+        elif 'orientacion' in c_norm or 'sexual' in c_norm: cols['orientation'] = c
+        elif 'etnico' in c_norm or 'etnia' in c_norm: cols['ethnicity'] = c
+        # Especiales
+        elif 'comunidade' in c_norm or 'sociedade' in c_norm: cols['community'] = c
+        elif 'discrimin' in c_norm: cols['discrim'].append(c)
+        # PWI (0-10) y Duke (Texto)
         elif 'satisfeit' in c_norm or 'satisfech' in c_norm:
-            if 'comunidade' in c_norm or 'sociedade' in c_norm or 'lugar na' in c_norm:
-                community_col = c
-            else:
-                pwi_cols.append(c)
-        elif any(k in str(sample).lower() for k in ['tanto como quero', 'nin moito']):
-            duke_cols.append(c)
+            if c != cols['community']: cols['pwi'].append(c)
+        else:
+            sample = df[c].dropna().astype(str).str.lower()
+            if len(sample) > 0 and sample.str.contains('tanto como quero|nin moito').any():
+                cols['duke'].append(c)
+    return cols
 
-    # --- CÁLCULOS NUMÉRICOS ---
+# --- 3. PROCESAMIENTO SEGÚN INSTRUCCIONES EXACTAS ---
+def procesar_need_index(df, cols):
+    df_c = df.copy()
     
-    # APOYO SOCIAL (Duke - 11 ítems)
-    likert_map = {'moito menos': 1, 'menos do que': 2, 'nin moito': 3, 'case tanto': 4, 'tanto como': 5}
-    for c in duke_cols:
-        df_c[c+'_n'] = df_c[c].apply(lambda x: next((v for k, v in likert_map.items() if k in normalizar(x)), 3))
-    df_c['Social_Support'] = df_c[[c+'_n' for c in duke_cols]].sum(axis=1)
+    # A. Cuantificar Duke (1-5)
+    likert = {'moito menos': 1, 'menos do que': 2, 'nin moito': 3, 'case tanto': 4, 'tanto como': 5}
+    for c in cols['duke']:
+        df_c[c+'_n'] = df_c[c].apply(lambda x: next((v for k, v in likert.items() if k in normalizar(x)), 3))
+    df_c['Social Support'] = df_c[[c+'_n' for c in cols['duke']]].sum(axis=1)
 
-    # BIENESTAR (PWI - 6 ítems, excluyendo comunidad)
-    for c in pwi_cols:
-        df_c[c] = pd.to_numeric(df_c[c], errors='coerce').fillna(df[c].mean() if df[c].mean() else 5)
-    df_c['Well_Being'] = df_c[pwi_cols].sum(axis=1)
+    # B. Cuantificar PWI (0-10)
+    for c in cols['pwi']:
+        df_c[c] = pd.to_numeric(df_c[c], errors='coerce').fillna(5)
+    df_c['Well-Being'] = df_c[cols['pwi']].sum(axis=1)
 
-    # DISCRIMINACIÓN (Suma de los 5 ítems)
-    for c in discrim_cols:
-        df_c[c+'_b'] = df_c[c].apply(puntuar_si_no)
-    df_c['Discr_Count'] = df_c[[c+'_b' for c in discrim_cols]].sum(axis=1)
-
-    # NORMATIVIDAD
-    # (Buscamos columnas de orientación y etnia)
-    orient_col = next((c for c in df.columns if 'orientacion' in normalizar(c)), None)
-    eth_col = next((c for c in df.columns if 'etnia' in normalizar(c) or 'etnico' in normalizar(c)), None)
+    # C. Cuantificar Discriminación (Suma de los 5 ítems)
+    def es_si(val):
+        v = normalizar(val)
+        return 1 if any(x in v for x in ['si', 'sim', 'verdade']) else 0
     
-    def check_norm(row):
-        sex = normalizar(row.get(orient_col, ""))
-        eth = normalizar(row.get(eth_col, ""))
-        is_lgtb = 1 if ('hetero' not in sex and sex != "") else 0
-        is_rac = 1 if not any(k in eth for k in ['espanol', 'galego', 'blanco']) and eth != "" else 0
-        return max(is_lgtb, is_rac)
-    
-    df_c['Norm_Binary'] = df_c.apply(check_norm, axis=1)
+    for c in cols['discrim']:
+        df_c[c+'_b'] = df_c[c].apply(es_si)
+    df_c['Discrimination'] = df_c[[c+'_b' for c in cols['discrim']]].sum(axis=1)
 
-    # --- PONDERACIÓN Z-SCORE (std ddof=0) ---
-    def z(series):
-        std = series.std(ddof=0)
-        return (series - series.mean()) / std if std > 0 else series * 0
+    # D. Crear Variable NORMATIVITY (OR lógico)
+    def calc_normativity(row):
+        sex = normalizar(row.get(cols['orientation'], ""))
+        eth = normalizar(row.get(cols['ethnicity'], ""))
+        # Es 1 si NO es hetero O si es racializado
+        es_lgtb = 1 if ('hetero' not in sex and sex != "") else 0
+        es_rac = 1 if not any(k in eth for k in ['espanol', 'galego', 'blanco']) and eth != "" else 0
+        return 1 if (es_lgtb == 1 or es_rac == 1) else 0
 
-    # Need_raw = 40% Supp(inv) + 30% WB(inv) + 15% Disc + 15% Norm
-    raw = (0.40 * -z(df_c['Social_Support'])) + \
-          (0.30 * -z(df_c['Well_Being'])) + \
-          (0.15 * z(df_c['Discr_Count'])) + \
-          (0.15 * z(df_c['Norm_Binary']))
-    
-    df_c['Indicator of Need'] = (50 + (raw * 10)).clip(0, 100).round(2)
-    
-    return df_c, duke_cols, pwi_cols, discrim_cols, community_col
+    df_c['Normativity'] = df_c.apply(calc_normativity, axis=1)
 
-# --- INTERFAZ ---
-st.title("🌱 Auditoría de Need Index")
-archivo = st.file_uploader("Sube el archivo", type=['xlsx', 'csv'])
+    # E. CALCULO ESTADÍSTICO (PASOS 2 A 6 DE LA LISTA)
+    df_c['ZSupport'] = zscore(df_c['Social Support'])
+    df_c['ZWell'] = zscore(df_c['Well-Being'])
+    df_c['ZDisc'] = zscore(df_c['Discrimination'])
+    df_c['ZNorm'] = zscore(df_c['Normativity'])
+
+    # Ponderación con inversión previa (-Z) para Support y Well
+    df_c['Need_raw'] = (
+        0.40 * (-df_c['ZSupport']) +
+        0.30 * (-df_c['ZWell']) +
+        0.15 * df_c['ZDisc'] +
+        0.15 * df_c['ZNorm']
+    )
+
+    # Transformación final
+    df_c['Indicator of Need'] = (50 + (df_c['Need_raw'] * 10)).clip(0, 100).round(2)
+    
+    return df_c.sort_values('Indicator of Need', ascending=False)
+
+# --- 4. INTERFAZ ---
+st.title("🌱 Need Index | My Rural Mentor")
+archivo = st.file_uploader("Subir base de datos", type=['xlsx', 'csv'])
 
 if archivo:
-    df = pd.read_csv(archivo, sep=None, engine='python') if archivo.name.endswith('.csv') else pd.read_excel(archivo)
-    df_res, d_cols, p_cols, dis_cols, com_col = calcular_indice_exacto(df)
+    df_in = pd.read_csv(archivo, sep=None, engine='python') if archivo.name.endswith('.csv') else pd.read_excel(archivo)
+    df_in.columns = df_in.columns.astype(str).str.strip()
     
-    st.info(f"Auditoría de columnas: Duke ({len(d_cols)}), PWI ({len(p_cols)}), Discrim ({len(dis_cols)})")
+    cols = detectar_columnas_mentor(df_in)
+    df_res = procesar_need_index(df_in, cols)
     
-    # Tabla de resultados
-    id_col = next((c for c in df.columns if 'id' in normalizar(c) or 'nome' in normalizar(c)), df.columns[0])
-    gen_col = next((c for c in df.columns if 'xenero' in normalizar(c)), None)
+    st.write("### 📋 Resultados del Triaje")
     
-    final_table = df_res[[id_col, 'Social_Support', 'Well_Being', 'Discr_Count', 'Indicator of Need']].copy()
-    st.dataframe(final_table.sort_values('Indicator of Need', ascending=False), use_container_width=True)
+    # Tabla final formateada
+    def label_sex(val):
+        sex = normalizar(val)
+        return 'LGTB+' if ('hetero' not in sex and sex != "") else 'Norm.'
+    
+    def label_eth(val):
+        eth = normalizar(val)
+        return 'Rac.' if not any(k in eth for k in ['espanol', 'galego', 'blanco']) and eth != "" else 'Norm.'
+
+    df_res['Sexual O.'] = df_res[cols['orientation']].apply(label_sex)
+    df_res['Ethnicity'] = df_res[cols['ethnicity']].apply(label_eth)
+    
+    # Formatear Gender a M/W
+    def label_gender(val):
+        v = normalizar(val)
+        if any(x in v for x in ['home', 'hombre', 'man']): return 'M'
+        if any(x in v for x in ['muller', 'mujer', 'woman']): return 'W'
+        return 'O'
+    df_res['Gender_Abr'] = df_res[cols['gender']].apply(label_gender)
+
+    tabla_final = df_res[[cols['id'], 'Gender_Abr', 'Sexual O.', 'Ethnicity', 
+                          'Social Support', 'Well-Being', 'Discrimination', 
+                          cols['community'], 'Indicator of Need']]
+    
+    tabla_final.columns = ['ID', 'Gender', 'Sexual O.', 'Ethnicity', 'Social Support', 
+                          'Well-Being', 'Discr.', 'Sense of Community', 'Indicator of Need']
+
+    st.dataframe(tabla_final, use_container_width=True, hide_index=True)
+
+    # Botón Descarga
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        tabla_final.to_excel(writer, index=False, sheet_name='Need_Index')
+    st.download_button("📥 Descargar Excel", output.getvalue(), "MRM_Results.xlsx")
